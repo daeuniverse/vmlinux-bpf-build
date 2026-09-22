@@ -1,0 +1,516 @@
+name: Build vmlinux (BTF)
+
+# =============================================================================
+# Reference implementation:
+#   https://github.com/QiuSimons/vmlinux-btf/blob/master/Makefile
+#
+# Build steps mirrored from the upstream Makefile (detached from the OpenWrt
+# build system):
+#   1. Download and extract the kernel source matching LINUX_VERSION into an
+#      isolated "shadow kernel" directory
+#   2. Start from a baseline .config and turn on the whole BPF / BTF option set
+#      via scripts/config
+#   3. make olddefconfig && make vmlinux (with DWARF debug info)
+#   4. pahole --btf_encode_detached to extract the BTF data out of vmlinux
+#   5. Upstream renames that BTF data to "vmlinux" at install time
+#      (/usr/lib/debug/boot/vmlinux)
+#
+# Artifacts produced by this workflow:
+#   vmlinux-x64-<version>.tar.xz
+#   vmlinux-arm64-<version>.tar.xz
+#   Each archive holds a single file named "vmlinux".
+#
+# Both archives are then published to a GitHub Release using the gh CLI.
+# The release tag is 0.1-<kernel version> (e.g. 0.1-6.6.1). The tag and the
+# release are checked first and only created when they do not exist yet;
+# existing assets are overwritten on re-runs.
+#
+# Usage: Actions -> Build vmlinux (BTF) -> Run workflow -> enter a kernel version
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: "Linux kernel version (e.g. 6.6.1 / 6.12 / 6.6-rc1)"
+        required: true
+        default: "6.6.1"
+      artifact:
+        description: "Which build output to package as vmlinux"
+        required: true
+        type: choice
+        default: btf
+        options:
+          # Detached BTF data extracted by pahole - identical to what the
+          # upstream Makefile installs, only a few MB in size
+          - btf
+          # The compiled vmlinux ELF itself (DWARF debug info + embedded BTF),
+          # very large
+          - vmlinux
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-vmlinux
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Validate the version and resolve the source URL (runs once, shared by
+  #    both architectures)
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Resolve kernel source
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tarball: ${{ steps.resolve.outputs.tarball }}
+      url: ${{ steps.resolve.outputs.url }}
+      git_tag: ${{ steps.resolve.outputs.git_tag }}
+    steps:
+      - name: Validate version and probe source URL
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.kernel_version }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${INPUT_VERSION#v}"
+          VERSION="${VERSION#V}"
+          VERSION="${VERSION#linux-}"
+          VERSION="$(echo "$VERSION" | tr -d '[:space:]')"
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$ ]]; then
+            echo "::error::Malformed version '${INPUT_VERSION}' - expected e.g. 6.6.1 / 6.12 / 6.6-rc1"
+            exit 1
+          fi
+
+          MAJOR="${VERSION%%.*}"
+          MINOR="$(echo "$VERSION" | cut -d. -f2 | cut -d- -f1)"
+          SERIES="v${MAJOR}.x"
+          TARBALL="linux-${VERSION}.tar.xz"
+
+          if [ "$MAJOR" -lt 5 ] || { [ "$MAJOR" -eq 5 ] && [ "$MINOR" -lt 2 ]; }; then
+            echo "::error::CONFIG_DEBUG_INFO_BTF requires Linux 5.2 or newer, got ${VERSION}"
+            exit 1
+          fi
+
+          URL=""
+          for base in \
+            "https://cdn.kernel.org/pub/linux/kernel/${SERIES}" \
+            "https://mirrors.edge.kernel.org/pub/linux/kernel/${SERIES}" \
+            "https://www.kernel.org/pub/linux/kernel/${SERIES}"
+          do
+            if curl -fsIL --http1.1 --connect-timeout 20 --max-time 60 --retry 3 "${base}/${TARBALL}" >/dev/null; then
+              URL="${base}/${TARBALL}"
+              break
+            fi
+          done
+
+          if [ -z "$URL" ]; then
+            echo "::warning::No official mirror provides ${TARBALL}, will fall back to git.kernel.org tag v${VERSION}"
+          fi
+
+          {
+            echo "version=${VERSION}"
+            echo "tarball=${TARBALL}"
+            echo "url=${URL}"
+            echo "git_tag=v${VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Resolved kernel source"
+            echo ""
+            echo "- Kernel version: \`${VERSION}\`"
+            echo "- Source URL: \`${URL:-git tag v${VERSION} (fallback)}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Kernel version: ${VERSION}"
+          echo "Source URL: ${URL:-git tag v${VERSION} (fallback)}"
+
+  # ---------------------------------------------------------------------------
+  # 2. Build both architectures
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build vmlinux (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    # A full kernel build with DWARF is slow; allow close to the GitHub job limit
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x64: native build on the runner
+          - arch: x64
+            kernel_arch: x86_64
+            cross_compile: ""
+            cross_packages: ""
+          # arm64: cross-compiled with the aarch64 toolchain
+          # (for a faster native build, switch the runner to ubuntu-24.04-arm
+          #  and clear cross_compile / cross_packages)
+          - arch: arm64
+            kernel_arch: arm64
+            cross_compile: aarch64-linux-gnu-
+            cross_packages: "gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu"
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      KERNEL_ARCH: ${{ matrix.kernel_arch }}
+      CROSS_COMPILE: ${{ matrix.cross_compile }}
+      ARCH_NAME: ${{ matrix.arch }}
+      ARTIFACT_KIND: ${{ inputs.artifact }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          set -euo pipefail
+          echo "Before cleanup:"
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift \
+            /usr/local/share/boost
+          sudo docker image prune -af || true
+          echo "After cleanup:"
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libncurses-dev zlib1g-dev \
+            python3 rsync cpio kmod dwarves \
+            xz-utils tar curl git ca-certificates \
+            ${{ matrix.cross_packages }}
+
+      - name: Check pahole version
+        run: |
+          set -euo pipefail
+          PAHOLE_VER="$(pahole --version | tr -d 'v' | cut -d. -f1,2)"
+          echo "pahole version: ${PAHOLE_VER}"
+          if awk -v v="${PAHOLE_VER}" 'BEGIN { exit (v + 0 < 1.16) ? 1 : 0 }'; then
+            echo "pahole version check passed"
+          else
+            echo "::error::pahole is too old (--btf_encode_detached requires >= 1.16), got ${PAHOLE_VER}"
+            exit 1
+          fi
+
+      - name: Download and extract kernel source
+        env:
+          SRC_URL: ${{ needs.prepare.outputs.url }}
+          TARBALL: ${{ needs.prepare.outputs.tarball }}
+          GIT_TAG: ${{ needs.prepare.outputs.git_tag }}
+        run: |
+          set -euo pipefail
+
+          SRC_DIR="${GITHUB_WORKSPACE}/linux-${VERSION}"
+          rm -rf "$SRC_DIR"
+
+          if [ -n "${SRC_URL}" ]; then
+            echo "Downloading ${SRC_URL}"
+            mkdir -p "${GITHUB_WORKSPACE}/dl"
+            curl -fL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
+              -o "${GITHUB_WORKSPACE}/dl/${TARBALL}" "${SRC_URL}"
+            tar -xJf "${GITHUB_WORKSPACE}/dl/${TARBALL}" -C "${GITHUB_WORKSPACE}"
+            rm -f "${GITHUB_WORKSPACE}/dl/${TARBALL}"
+          else
+            echo "No official mirror provides ${TARBALL}, falling back to git.kernel.org tag ${GIT_TAG}"
+            for repo in \
+              "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" \
+              "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+            do
+              if git clone --depth 1 --branch "${GIT_TAG}" "$repo" "$SRC_DIR"; then
+                rm -rf "${SRC_DIR}/.git"
+                break
+              fi
+              rm -rf "$SRC_DIR"
+            done
+          fi
+
+          if [ ! -f "${SRC_DIR}/Makefile" ]; then
+            echo "::error::Could not fetch kernel source for ${VERSION}"
+            exit 1
+          fi
+
+          echo "SRC_DIR=${SRC_DIR}" >> "$GITHUB_ENV"
+          echo "Source directory: ${SRC_DIR}"
+          head -n 5 "${SRC_DIR}/Makefile"
+
+      - name: Generate and adjust .config (mirrors the upstream Makefile options)
+        run: |
+          set -euo pipefail
+          cd "${SRC_DIR}"
+
+          # Baseline config: x64 -> x86_64_defconfig, arm64 -> defconfig
+          make ARCH="${KERNEL_ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
+
+          # Apply the options used by the upstream Makefile Build/Compile rule.
+          # A few of them do not exist in older kernels; failures here are not
+          # fatal because the verification afterwards catches real problems.
+          while read -r action symbol value; do
+            case "$action" in
+              "" | "#"*) continue ;;
+              set-str)
+                value="${value%\"}"
+                value="${value#\"}"
+                ./scripts/config --file .config --set-str "$symbol" "$value" || true
+                ;;
+              *)
+                ./scripts/config --file .config "--${action}" "$symbol" || true
+                ;;
+            esac
+          done <<'CONFIG_OPTIONS'
+          # --- Copied from the QiuSimons/vmlinux-btf Makefile ---
+          disable WERROR
+          enable CGROUPS
+          enable CGROUP_BPF
+          enable SOCK_CGROUP_DATA
+          enable KALLSYMS
+          enable PERF_EVENTS
+          enable TRACEPOINTS
+          enable KPROBES
+          enable UPROBES
+          enable BPF
+          enable BPF_SYSCALL
+          enable BPF_JIT
+          enable BPF_JIT_DEFAULT_ON
+          enable INET
+          enable NET_INGRESS
+          enable NET_EGRESS
+          enable BPF_STREAM_PARSER
+          enable XDP_SOCKETS
+          enable NET_SCHED
+          enable NET_SCH_INGRESS
+          enable NET_CLS
+          enable NET_CLS_ACT
+          enable KPROBE_EVENTS
+          enable UPROBE_EVENTS
+          enable BPF_EVENTS
+          enable DEBUG_KERNEL
+          enable DEBUG_INFO
+          disable DEBUG_INFO_NONE
+          enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+          disable DEBUG_INFO_REDUCED
+          disable DEBUG_INFO_SPLIT
+          enable DEBUG_INFO_BTF
+          set-str EXTRA_FIRMWARE ""
+          set-str INITRAMFS_SOURCE ""
+          # --- Extra options required in CI to avoid signing/certificate errors ---
+          set-str SYSTEM_TRUSTED_KEYS ""
+          set-str SYSTEM_REVOCATION_KEYS ""
+          CONFIG_OPTIONS
+
+          make ARCH="${KERNEL_ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
+
+          echo "===== Key option verification ====="
+          # Required options: fail the step if any of them is missing
+          REQUIRED="CGROUPS CGROUP_BPF KALLSYMS PERF_EVENTS KPROBES UPROBES
+                    BPF BPF_SYSCALL BPF_JIT INET XDP_SOCKETS
+                    KPROBE_EVENTS UPROBE_EVENTS DEBUG_INFO DEBUG_INFO_BTF"
+          # Optional options: not offered by every kernel version, warn only
+          OPTIONAL="TRACEPOINTS BPF_EVENTS SOCK_CGROUP_DATA NET_SCH_INGRESS NET_CLS NET_CLS_ACT"
+
+          failed=0
+          for sym in ${REQUIRED}; do
+            if grep -q "^CONFIG_${sym}=y" .config; then
+              echo "  [required] CONFIG_${sym}=y"
+            else
+              echo "::error::CONFIG_${sym} is not enabled, check whether this kernel version supports it"
+              failed=1
+            fi
+          done
+          for sym in ${OPTIONAL}; do
+            if grep -q "^CONFIG_${sym}=y" .config; then
+              echo "  [optional] CONFIG_${sym}=y"
+            else
+              echo "::warning::CONFIG_${sym} not enabled (this kernel version may not provide it)"
+            fi
+          done
+
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Build vmlinux
+        run: |
+          set -euo pipefail
+          cd "${SRC_DIR}"
+          echo "Building: ARCH=${KERNEL_ARCH} CROSS_COMPILE=${CROSS_COMPILE:-<native>} JOBS=$(nproc)"
+          make -j"$(nproc)" \
+            ARCH="${KERNEL_ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            KBUILD_HOSTLDFLAGS="-lz" \
+            vmlinux
+          ls -lh ./vmlinux
+
+      - name: Encode BTF and package vmlinux-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}.tar.xz
+        run: |
+          set -euo pipefail
+          cd "${SRC_DIR}"
+
+          OUT_DIR="${RUNNER_TEMP}/pkg"
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
+
+          # Same as upstream: extract the detached BTF data from vmlinux
+          pahole --btf_encode_detached="${OUT_DIR}/vmlinux.btf" ./vmlinux
+
+          # The packaged file must be named exactly "vmlinux"
+          if [ "${ARTIFACT_KIND}" = "vmlinux" ]; then
+            cp ./vmlinux "${OUT_DIR}/vmlinux"
+          else
+            cp "${OUT_DIR}/vmlinux.btf" "${OUT_DIR}/vmlinux"
+          fi
+          ls -lh "${OUT_DIR}/vmlinux"
+          file "${OUT_DIR}/vmlinux" || true
+
+          ARCHIVE="vmlinux-${ARCH_NAME}-${VERSION}.tar.xz"
+          # tar + xz (multi-threaded, otherwise packing a full vmlinux is slow)
+          tar -C "${OUT_DIR}" -cf - vmlinux | xz -T0 -6 > "${GITHUB_WORKSPACE}/${ARCHIVE}"
+
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+          sha256sum "${GITHUB_WORKSPACE}/${ARCHIVE}" | tee "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256"
+
+          echo "===== Archive contents ====="
+          tar -tvJf "${GITHUB_WORKSPACE}/${ARCHIVE}"
+          ls -lh "${GITHUB_WORKSPACE}/${ARCHIVE}"
+
+          {
+            echo "### vmlinux-${ARCH_NAME}-${VERSION}.tar.xz"
+            echo ""
+            echo '```'
+            tar -tvJf "${GITHUB_WORKSPACE}/${ARCHIVE}"
+            echo '```'
+            echo ""
+            echo "- Artifact kind: \`${ARTIFACT_KIND}\`"
+            echo "- pahole: \`$(pahole --version)\`"
+            echo "- SHA256: \`$(cut -d' ' -f1 "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmlinux-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
+          path: |
+            vmlinux-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}.tar.xz
+            vmlinux-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}.tar.xz.sha256
+          # Already xz-compressed, no need to compress again
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3. Publish the archives to a GitHub Release (tag: 0.1-<kernel version>)
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub release
+    needs: [prepare, build]
+    # Publish only when both architectures were built successfully
+    if: ${{ needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    # Writing to a release needs contents: write (the workflow default is read)
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      KERNEL_VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: "0.1-${{ needs.prepare.outputs.version }}"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vmlinux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check whether the tag and the release already exist
+        id: check
+        run: |
+          set -euo pipefail
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} already exists - skipping creation, assets will be overwritten."
+          else
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} does not exist - it will be created."
+          fi
+
+          if gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} already exists - it will be reused."
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} does not exist - gh will create it."
+          fi
+
+      - name: Create tag and release with gh
+        if: steps.check.outputs.release_exists == 'false'
+        env:
+          TAG_EXISTS: ${{ steps.check.outputs.tag_exists }}
+        run: |
+          set -euo pipefail
+
+          cat > "${RUNNER_TEMP}/release-notes.md" <<EOF
+          Prebuilt vmlinux with embedded BTF, for CO-RE eBPF programs.
+
+          - Kernel version: ${KERNEL_VERSION}
+          - Architectures: x64 (x86_64), arm64 (aarch64)
+          - Build recipe: same option set as the upstream QiuSimons/vmlinux-btf Makefile
+
+          Assets:
+
+          - vmlinux-x64-${KERNEL_VERSION}.tar.xz
+          - vmlinux-arm64-${KERNEL_VERSION}.tar.xz
+          - SHA256 checksums (.sha256)
+
+          Each archive contains a single file named vmlinux.
+
+          Built by GitHub Actions run #${GITHUB_RUN_NUMBER} from commit ${GITHUB_SHA}.
+          EOF
+
+          args=(--title "0.1-${KERNEL_VERSION}" --notes-file "${RUNNER_TEMP}/release-notes.md")
+          if [ "${TAG_EXISTS}" = "false" ]; then
+            # Point the newly created tag at the commit this workflow ran on
+            args+=(--target "${GITHUB_SHA}")
+          fi
+
+          gh release create "${TAG}" "${args[@]}"
+
+      - name: Upload archives with gh
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          files=(dist/*.tar.xz dist/*.sha256)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No archives found in dist/, did the build jobs upload their artifacts?"
+            exit 1
+          fi
+
+          echo "Uploading to release ${TAG}:"
+          printf '  %s\n' "${files[@]}"
+          gh release upload "${TAG}" "${files[@]}" --clobber
+
+          # The upload already succeeded, so do not fail the step if the summary
+          # lookup goes wrong
+          {
+            echo "### Release ${TAG}"
+            echo ""
+            echo "- URL: $(gh release view "${TAG}" --json url -q .url || true)"
+            echo "- Assets:"
+            gh release view "${TAG}" --json assets -q '.assets[].name' 2>/dev/null \
+              | sed 's/^/  - /' || true
+          } >> "$GITHUB_STEP_SUMMARY"
