@@ -34,7 +34,7 @@ on:
       kernel_version:
         description: "Linux kernel version (e.g. 6.6.1 / 6.12 / 6.6-rc1)"
         required: true
-        default: "6.6.1"
+        default: "6.12.111"
       artifact:
         description: "Which build output to package as vmlinux"
         required: true
@@ -268,6 +268,15 @@ jobs:
                 ;;
             esac
           done <<'CONFIG_OPTIONS'
+          # --- Dependency chain required by the upstream option set ---
+          # In kernel/trace/Kconfig, KPROBE_EVENTS / UPROBE_EVENTS / BPF_EVENTS sit
+          # inside an "if FTRACE" block, and TRACING (which selects TRACEPOINTS) is
+          # only selected by those symbols. The arm64 defconfig ships an explicit
+          # "# CONFIG_FTRACE is not set", and an explicit n wins over
+          # "default y if DEBUG_KERNEL", so olddefconfig would silently drop all
+          # of those options. FTRACE is therefore enabled explicitly.
+          enable FTRACE
+          enable TRACING
           # --- Copied from the QiuSimons/vmlinux-btf Makefile ---
           disable WERROR
           enable CGROUPS
@@ -336,6 +345,9 @@ jobs:
           done
 
           if [ "${failed}" -ne 0 ]; then
+            echo "Dependency state, useful to diagnose the missing symbols above:"
+            grep -E "^CONFIG_(FTRACE|TRACING|TRACEPOINTS|PROBE_EVENTS|UPROBES|KPROBES|KPROBE_EVENTS|UPROBE_EVENTS|BPF_EVENTS)=" .config || true
+            grep -E "^# CONFIG_(FTRACE|TRACING|TRACEPOINTS|UPROBES|KPROBE_EVENTS|UPROBE_EVENTS|BPF_EVENTS) is not set" .config || true
             exit 1
           fi
 
