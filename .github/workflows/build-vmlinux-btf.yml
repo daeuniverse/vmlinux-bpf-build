@@ -300,10 +300,25 @@ jobs:
           cross_prefix="${toolchain_bin}/$(basename "${cross_gcc}" | sed 's/gcc$//')"
           echo "OpenWrt toolchain: ${cross_prefix}"
 
+          # The OpenWrt toolchain looks up its sysroot through $STAGING_DIR and
+          # warns "environment variable 'STAGING_DIR' not defined" without it.
+          # The buildroot exports STAGING_DIR and STAGING_DIR_HOST (see rules.mk),
+          # where STAGING_DIR is staging_dir/target-<arch>_<libc>, not staging_dir
+          # itself. Looking it up by glob keeps this identical for x86_64 and for
+          # every aarch64 variant.
+          staging_dir="$(find "${SDK_DIR}/staging_dir" -mindepth 1 -maxdepth 1 -type d -name 'target-*' | head -n1)"
+          if [ -z "${staging_dir}" ]; then
+            echo "::error::The SDK does not provide a staging_dir/target-* directory"
+            exit 1
+          fi
+          echo "STAGING_DIR: ${staging_dir}"
+
           {
             echo "SDK_DIR=${SDK_DIR}"
             echo "SDK_KERNEL_CONFIG=${kernel_dir}/.config"
             echo "CROSS_COMPILE=${cross_prefix}"
+            echo "STAGING_DIR=${staging_dir}"
+            echo "STAGING_DIR_HOST=${SDK_DIR}/staging_dir/host"
           } >> "$GITHUB_ENV"
 
           # Also expose the OpenWrt toolchain on PATH, the same way the OpenWrt
@@ -315,13 +330,33 @@ jobs:
           set -euo pipefail
 
           echo "CROSS_COMPILE=${CROSS_COMPILE}"
+          echo "STAGING_DIR=${STAGING_DIR}"
+
+          # The OpenWrt gcc resolves its sysroot through STAGING_DIR, so an
+          # unset or wrong value would silently change what it searches
+          if [ ! -d "${STAGING_DIR}" ]; then
+            echo "::error::STAGING_DIR '${STAGING_DIR}' does not exist"
+            exit 1
+          fi
+
           "${CROSS_COMPILE}gcc" --version | head -n1
           echo "Target triple: $("${CROSS_COMPILE}gcc" -dumpmachine)"
 
           # Smoke test: cross compile a tiny object, so a broken toolchain fails
           # here instead of hours into the kernel build
           printf 'int openwrt_gcc_smoke_test(void) { return 0; }\n' > "${RUNNER_TEMP}/smoke.c"
-          "${CROSS_COMPILE}gcc" -O2 -c "${RUNNER_TEMP}/smoke.c" -o "${RUNNER_TEMP}/smoke.o"
+          if ! "${CROSS_COMPILE}gcc" -O2 -c "${RUNNER_TEMP}/smoke.c" -o "${RUNNER_TEMP}/smoke.o" 2> "${RUNNER_TEMP}/smoke.err"; then
+            echo "::error::The OpenWrt cross compiler failed to compile a trivial file"
+            cat "${RUNNER_TEMP}/smoke.err"
+            exit 1
+          fi
+          cat "${RUNNER_TEMP}/smoke.err"
+
+          if grep -q "STAGING_DIR" "${RUNNER_TEMP}/smoke.err"; then
+            echo "::error::The OpenWrt toolchain still complains about STAGING_DIR"
+            exit 1
+          fi
+
           file "${RUNNER_TEMP}/smoke.o"
 
           if [ "${KERNEL_ARCH}" = "x86_64" ]; then
