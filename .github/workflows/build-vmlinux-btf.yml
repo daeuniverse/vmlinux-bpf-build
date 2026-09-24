@@ -4,37 +4,63 @@ name: Build vmlinux (BTF)
 # Reference implementation:
 #   https://github.com/QiuSimons/vmlinux-btf/blob/master/Makefile
 #
-# Build steps mirrored from the upstream Makefile (detached from the OpenWrt
-# build system):
-#   1. Download and extract the kernel source matching LINUX_VERSION into an
-#      isolated "shadow kernel" directory
-#   2. Start from a baseline .config and turn on the whole BPF / BTF option set
-#      via scripts/config
-#   3. make olddefconfig && make vmlinux (with DWARF debug info)
-#   4. pahole --btf_encode_detached to extract the BTF data out of vmlinux
-#   5. Upstream renames that BTF data to "vmlinux" at install time
-#      (/usr/lib/debug/boot/vmlinux)
+# The upstream Makefile is an OpenWrt package that builds a BTF-enabled vmlinux
+# in a "shadow kernel" tree, using the target kernel's .config as the baseline.
+# This workflow does the same, but takes everything from the official OpenWrt
+# SDK of each target, so no full OpenWrt buildroot (and no toolchain build) is
+# needed:
 #
-# Artifacts produced by this workflow:
-#   vmlinux-x64-<version>.tar.xz
-#   vmlinux-arm64-<version>.tar.xz
-#   Each archive holds a single file named "vmlinux".
+#   1. Download the SDK published for the target/subtarget
+#   2. Take from the SDK: the kernel version, the exact kernel .config OpenWrt
+#      ships for that target, and the matching cross toolchain
+#   3. Download the matching upstream kernel source
+#   4. Apply the upstream BTF / BPF option set on top of that .config
+#   5. make olddefconfig && make vmlinux (with DWARF debug info)
+#   6. pahole --btf_encode_detached to extract the BTF data out of vmlinux
 #
-# Both archives are then published to a GitHub Release using the gh CLI.
-# The release tag is 0.1-<kernel version> (e.g. 0.1-6.6.1). The tag and the
-# release are checked first and only created when they do not exist yet;
+# The SDK does not carry the kernel source tree (it is stripped down to
+# headers, Module.symvers and the prebuilt modules) and OpenWrt leaves the
+# target specific patches out of it, so the kernel is compiled from the
+# upstream release sources. This matches upstream's shadow kernel, which does
+# not apply any patch either.
+#
+# Targets built here, named by their OpenWrt architecture (arch_packages):
+#   x86_64             -> x86/64
+#   aarch64_generic    -> armsr/armv8
+#   aarch64_cortex-a53 -> mediatek/filogic
+#   aarch64_cortex-a72 -> bcm27xx/bcm2711
+#   aarch64_cortex-a76 -> bcm27xx/bcm2712
+#
+# Several targets share the same arch_packages, so the list below picks one
+# representative target/subtarget per architecture. If a device needs a
+# different kernel .config, swap in another target/subtarget that reports the
+# same arch_packages (check profiles.json of that target).
+#
+# Naming of the archive and the uploaded artifact:
+#   <openwrt_version>-vmlinux-<openwrt_arch>-<kernel_version>
+#   e.g. 25.12.5-vmlinux-aarch64_cortex-a53-6.12.94.tar.xz
+# Each archive holds a single file named "vmlinux".
+#
+# All architectures sharing the same kernel version are published together in
+# one GitHub Release with the gh CLI, tagged:
+#   openwrt-<openwrt_version>-<kernel_version>
+#   e.g. openwrt-25.12.5-6.12.94
+# The tag is checked first and only created when it does not exist yet;
 # existing assets are overwritten on re-runs.
 #
-# Usage: Actions -> Build vmlinux (BTF) -> Run workflow -> enter a kernel version
+# Note: the five kernel builds run in parallel, each one taking 1-3 hours.
+# Trim the target list below if your plan limits concurrent jobs or minutes.
+#
+# Usage: Actions -> Build vmlinux (BTF) -> Run workflow -> enter an OpenWrt version
 # =============================================================================
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_version:
-        description: "Linux kernel version (e.g. 6.6.1 / 6.12 / 6.6-rc1)"
+      openwrt_version:
+        description: "OpenWrt release version (e.g. 25.12.5 / 24.10.8)"
         required: true
-        default: "6.12.111"
+        default: "25.12.5"
       artifact:
         description: "Which build output to package as vmlinux"
         required: true
@@ -57,83 +83,110 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. Validate the version and resolve the source URL (runs once, shared by
-  #    both architectures)
+  # 1. Resolve the SDK, the kernel version and the build matrix
   # ---------------------------------------------------------------------------
   prepare:
-    name: Resolve kernel source
+    name: Resolve OpenWrt SDKs
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.resolve.outputs.version }}
-      tarball: ${{ steps.resolve.outputs.tarball }}
-      url: ${{ steps.resolve.outputs.url }}
-      git_tag: ${{ steps.resolve.outputs.git_tag }}
+      openwrt_version: ${{ steps.resolve.outputs.openwrt_version }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
     steps:
-      - name: Validate version and probe source URL
+      - name: Resolve SDK, kernel version and matrix
         id: resolve
         env:
-          INPUT_VERSION: ${{ inputs.kernel_version }}
+          INPUT_VERSION: ${{ inputs.openwrt_version }}
         run: |
           set -euo pipefail
 
-          VERSION="${INPUT_VERSION#v}"
-          VERSION="${VERSION#V}"
-          VERSION="${VERSION#linux-}"
-          VERSION="$(echo "$VERSION" | tr -d '[:space:]')"
+          OPENWRT_VERSION="$(echo "${INPUT_VERSION}" | tr -d '[:space:]')"
+          OPENWRT_VERSION="${OPENWRT_VERSION#v}"
 
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$ ]]; then
-            echo "::error::Malformed version '${INPUT_VERSION}' - expected e.g. 6.6.1 / 6.12 / 6.6-rc1"
+          if ! [[ "${OPENWRT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Malformed OpenWrt version '${INPUT_VERSION}' - expected a release version such as 25.12.5 or 24.10.8"
             exit 1
           fi
 
-          MAJOR="${VERSION%%.*}"
-          MINOR="$(echo "$VERSION" | cut -d. -f2 | cut -d- -f1)"
-          SERIES="v${MAJOR}.x"
-          TARBALL="linux-${VERSION}.tar.xz"
-
-          if [ "$MAJOR" -lt 5 ] || { [ "$MAJOR" -eq 5 ] && [ "$MINOR" -lt 2 ]; }; then
-            echo "::error::CONFIG_DEBUG_INFO_BTF requires Linux 5.2 or newer, got ${VERSION}"
+          BASE="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}"
+          if ! curl -fsIL --http1.1 --connect-timeout 20 --max-time 60 "${BASE}/" >/dev/null; then
+            echo "::error::OpenWrt ${OPENWRT_VERSION} is not available at downloads.openwrt.org"
             exit 1
           fi
 
-          URL=""
-          for base in \
-            "https://cdn.kernel.org/pub/linux/kernel/${SERIES}" \
-            "https://mirrors.edge.kernel.org/pub/linux/kernel/${SERIES}" \
-            "https://www.kernel.org/pub/linux/kernel/${SERIES}"
-          do
-            if curl -fsIL --http1.1 --connect-timeout 20 --max-time 60 --retry 3 "${base}/${TARBALL}" >/dev/null; then
-              URL="${base}/${TARBALL}"
-              break
-            fi
-          done
-
-          if [ -z "$URL" ]; then
-            echo "::warning::No official mirror provides ${TARBALL}, will fall back to git.kernel.org tag v${VERSION}"
-          fi
-
+          : > /tmp/matrix.jsonl
           {
-            echo "version=${VERSION}"
-            echo "tarball=${TARBALL}"
-            echo "url=${URL}"
-            echo "git_tag=v${VERSION}"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "### Resolved kernel source"
+            echo "### OpenWrt ${OPENWRT_VERSION}"
             echo ""
-            echo "- Kernel version: \`${VERSION}\`"
-            echo "- Source URL: \`${URL:-git tag v${VERSION} (fallback)}\`"
+            echo "| OpenWrt arch | target/subtarget | kernel | SDK |"
+            echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Kernel version: ${VERSION}"
-          echo "Source URL: ${URL:-git tag v${VERSION} (fallback)}"
+          # The expected arch_packages is verified against profiles.json, so a
+          # wrong target/subtarget pairing fails here instead of silently
+          # producing a vmlinux for the wrong architecture.
+          while IFS='|' read -r openwrt_arch target subtarget kernel_arch; do
+            case "${openwrt_arch}" in
+              "" | "#"*) continue ;;
+            esac
+
+            url="${BASE}/targets/${target}/${subtarget}"
+
+            profiles="$(curl -fsSL --http1.1 --retry 3 --max-time 60 "${url}/profiles.json")"
+            got_arch="$(echo "${profiles}" | jq -r '.arch_packages')"
+            kernel_version="$(echo "${profiles}" | jq -r '.linux_kernel.version // empty')"
+
+            if [ "${got_arch}" != "${openwrt_arch}" ]; then
+              echo "::error::${target}/${subtarget} reports arch_packages=${got_arch}, expected ${openwrt_arch}"
+              exit 1
+            fi
+            if [ -z "${kernel_version}" ]; then
+              echo "::error::${target}/${subtarget} does not report a kernel version in profiles.json"
+              exit 1
+            fi
+
+            index="$(curl -fsSL --http1.1 --retry 3 --max-time 60 "${url}/")"
+            sdk_name="$(echo "${index}" | grep -oE 'openwrt-sdk-[^"<>]*\.tar\.(zst|xz)' | head -n1)"
+            if [ -z "${sdk_name}" ]; then
+              echo "::error::OpenWrt ${OPENWRT_VERSION} publishes no SDK for ${target}/${subtarget}"
+              exit 1
+            fi
+
+            dist_name="${OPENWRT_VERSION}-vmlinux-${openwrt_arch}-${kernel_version}"
+
+            jq -nc \
+              --arg openwrt_arch "${openwrt_arch}" \
+              --arg target "${target}" \
+              --arg subtarget "${subtarget}" \
+              --arg kernel_arch "${kernel_arch}" \
+              --arg kernel_version "${kernel_version}" \
+              --arg sdk_url "${url}/${sdk_name}" \
+              --arg sdk_name "${sdk_name}" \
+              --arg dist_name "${dist_name}" \
+              '{openwrt_arch:$openwrt_arch,target:$target,subtarget:$subtarget,kernel_arch:$kernel_arch,kernel_version:$kernel_version,sdk_url:$sdk_url,sdk_name:$sdk_name,dist_name:$dist_name}' \
+              >> /tmp/matrix.jsonl
+
+            echo "| ${openwrt_arch} | ${target}/${subtarget} | ${kernel_version} | ${sdk_name} |" >> "$GITHUB_STEP_SUMMARY"
+          done <<'TARGETS'
+          # openwrt_arch|target|subtarget|kernel_arch
+          x86_64|x86|64|x86_64
+          aarch64_generic|armsr|armv8|arm64
+          aarch64_cortex-a53|mediatek|filogic|arm64
+          aarch64_cortex-a72|bcm27xx|bcm2711|arm64
+          aarch64_cortex-a76|bcm27xx|bcm2712|arm64
+          TARGETS
+
+          echo "Resolved $(wc -l < /tmp/matrix.jsonl) targets"
+
+          {
+            echo "openwrt_version=${OPENWRT_VERSION}"
+            echo "matrix=$(jq -sc . /tmp/matrix.jsonl)"
+          } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # 2. Build both architectures
+  # 2. Build one BTF-enabled vmlinux per OpenWrt architecture
   # ---------------------------------------------------------------------------
   build:
-    name: Build vmlinux (${{ matrix.arch }})
+    name: Build vmlinux (${{ matrix.openwrt_arch }})
     needs: prepare
     runs-on: ubuntu-24.04
     # A full kernel build with DWARF is slow; allow close to the GitHub job limit
@@ -141,24 +194,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # x64: native build on the runner
-          - arch: x64
-            kernel_arch: x86_64
-            cross_compile: ""
-            cross_packages: ""
-          # arm64: cross-compiled with the aarch64 toolchain
-          # (for a faster native build, switch the runner to ubuntu-24.04-arm
-          #  and clear cross_compile / cross_packages)
-          - arch: arm64
-            kernel_arch: arm64
-            cross_compile: aarch64-linux-gnu-
-            cross_packages: "gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu"
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      VERSION: ${{ needs.prepare.outputs.version }}
+      OPENWRT_VERSION: ${{ needs.prepare.outputs.openwrt_version }}
+      OPENWRT_ARCH: ${{ matrix.openwrt_arch }}
       KERNEL_ARCH: ${{ matrix.kernel_arch }}
-      CROSS_COMPILE: ${{ matrix.cross_compile }}
-      ARCH_NAME: ${{ matrix.arch }}
+      KERNEL_VERSION: ${{ matrix.kernel_version }}
+      SDK_URL: ${{ matrix.sdk_url }}
+      SDK_NAME: ${{ matrix.sdk_name }}
+      DIST_NAME: ${{ matrix.dist_name }}
       ARTIFACT_KIND: ${{ inputs.artifact }}
     steps:
       - name: Checkout
@@ -188,8 +232,7 @@ jobs:
             build-essential bc bison flex \
             libssl-dev libelf-dev libncurses-dev zlib1g-dev \
             python3 rsync cpio kmod dwarves \
-            xz-utils tar curl git ca-certificates \
-            ${{ matrix.cross_packages }}
+            xz-utils zstd tar curl git ca-certificates
 
       - name: Check pahole version
         run: |
@@ -203,31 +246,92 @@ jobs:
             exit 1
           fi
 
-      - name: Download and extract kernel source
-        env:
-          SRC_URL: ${{ needs.prepare.outputs.url }}
-          TARBALL: ${{ needs.prepare.outputs.tarball }}
-          GIT_TAG: ${{ needs.prepare.outputs.git_tag }}
+      - name: Download and extract the OpenWrt SDK
         run: |
           set -euo pipefail
 
-          SRC_DIR="${GITHUB_WORKSPACE}/linux-${VERSION}"
+          echo "SDK: ${SDK_NAME}"
+          mkdir -p "${RUNNER_TEMP}/sdk-dl" "${RUNNER_TEMP}/sdk"
+          curl -fL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
+            -o "${RUNNER_TEMP}/sdk-dl/${SDK_NAME}" "${SDK_URL}"
+
+          case "${SDK_NAME}" in
+            *.tar.zst) opts=(--zstd) ;;
+            *.tar.xz)  opts=(-J) ;;
+            *)         opts=() ;;
+          esac
+          tar "${opts[@]}" -C "${RUNNER_TEMP}/sdk" -xf "${RUNNER_TEMP}/sdk-dl/${SDK_NAME}"
+          rm -rf "${RUNNER_TEMP}/sdk-dl"
+
+          SDK_DIR="$(find "${RUNNER_TEMP}/sdk" -mindepth 1 -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n1)"
+          if [ -z "${SDK_DIR}" ]; then
+            echo "::error::Unexpected SDK layout, no openwrt-sdk-* directory found"
+            exit 1
+          fi
+          echo "SDK directory: ${SDK_DIR}"
+
+          # The SDK ships the exact kernel .config of this target/subtarget
+          kernel_dir="$(find "${SDK_DIR}/build_dir" -maxdepth 4 -type d -path '*linux-*/linux-*' | head -n1)"
+          if [ -z "${kernel_dir}" ] || [ ! -f "${kernel_dir}/.config" ]; then
+            echo "::error::The SDK does not provide the kernel .config (expected build_dir/*/linux-*/linux-*/.config)"
+            exit 1
+          fi
+
+          sdk_kernel_version="${kernel_dir##*/linux-}"
+          echo "Kernel version in the SDK: ${sdk_kernel_version} (profiles.json reported ${KERNEL_VERSION})"
+          if [ "${sdk_kernel_version}" != "${KERNEL_VERSION}" ]; then
+            echo "::warning::OpenWrt reports ${KERNEL_VERSION} but the SDK ships ${sdk_kernel_version}"
+          fi
+
+          cross_gcc="$(find "${SDK_DIR}"/staging_dir/toolchain-*/bin -maxdepth 1 -name '*-openwrt-linux-musl-gcc' | head -n1)"
+          if [ -z "${cross_gcc}" ]; then
+            echo "::error::The SDK does not provide a cross toolchain"
+            exit 1
+          fi
+          cross_prefix="$(basename "${cross_gcc}")"
+          cross_prefix="${cross_prefix%gcc}"
+          echo "Cross toolchain: ${cross_gcc}"
+
+          {
+            echo "SDK_DIR=${SDK_DIR}"
+            echo "SDK_KERNEL_CONFIG=${kernel_dir}/.config"
+            echo "CROSS_COMPILE=${cross_prefix}"
+          } >> "$GITHUB_ENV"
+
+      - name: Download and extract the kernel source
+        run: |
+          set -euo pipefail
+
+          SERIES="v${KERNEL_VERSION%%.*}.x"
+          TARBALL="linux-${KERNEL_VERSION}.tar.xz"
+          SRC_DIR="${GITHUB_WORKSPACE}/linux-${KERNEL_VERSION}"
           rm -rf "$SRC_DIR"
 
-          if [ -n "${SRC_URL}" ]; then
-            echo "Downloading ${SRC_URL}"
-            mkdir -p "${GITHUB_WORKSPACE}/dl"
+          URL=""
+          for base in \
+            "https://cdn.kernel.org/pub/linux/kernel/${SERIES}" \
+            "https://mirrors.edge.kernel.org/pub/linux/kernel/${SERIES}" \
+            "https://www.kernel.org/pub/linux/kernel/${SERIES}"
+          do
+            if curl -fsIL --http1.1 --connect-timeout 20 --max-time 60 --retry 3 "${base}/${TARBALL}" >/dev/null; then
+              URL="${base}/${TARBALL}"
+              break
+            fi
+          done
+
+          if [ -n "${URL}" ]; then
+            echo "Downloading ${URL}"
             curl -fL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
-              -o "${GITHUB_WORKSPACE}/dl/${TARBALL}" "${SRC_URL}"
-            tar -xJf "${GITHUB_WORKSPACE}/dl/${TARBALL}" -C "${GITHUB_WORKSPACE}"
-            rm -f "${GITHUB_WORKSPACE}/dl/${TARBALL}"
+              -o "${RUNNER_TEMP}/${TARBALL}" "${URL}"
+            tar -xJf "${RUNNER_TEMP}/${TARBALL}" -C "${GITHUB_WORKSPACE}"
+            rm -f "${RUNNER_TEMP}/${TARBALL}"
           else
-            echo "No official mirror provides ${TARBALL}, falling back to git.kernel.org tag ${GIT_TAG}"
+            echo "No official mirror provides ${TARBALL}, falling back to git.kernel.org tag v${KERNEL_VERSION}"
             for repo in \
               "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" \
               "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
             do
-              if git clone --depth 1 --branch "${GIT_TAG}" "$repo" "$SRC_DIR"; then
+              if git clone --depth 1 --branch "v${KERNEL_VERSION}" "$repo" "$SRC_DIR"; then
                 rm -rf "${SRC_DIR}/.git"
                 break
               fi
@@ -236,25 +340,27 @@ jobs:
           fi
 
           if [ ! -f "${SRC_DIR}/Makefile" ]; then
-            echo "::error::Could not fetch kernel source for ${VERSION}"
+            echo "::error::Could not fetch kernel source for ${KERNEL_VERSION}"
             exit 1
           fi
 
           echo "SRC_DIR=${SRC_DIR}" >> "$GITHUB_ENV"
           echo "Source directory: ${SRC_DIR}"
-          head -n 5 "${SRC_DIR}/Makefile"
 
       - name: Generate and adjust .config (mirrors the upstream Makefile options)
         run: |
           set -euo pipefail
           cd "${SRC_DIR}"
 
-          # Baseline config: x64 -> x86_64_defconfig, arm64 -> defconfig
-          make ARCH="${KERNEL_ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
+          # Baseline: the exact kernel .config that the OpenWrt SDK ships for
+          # this target/subtarget. Upstream does the same by copying
+          # $(LINUX_DIR)/.config, which is far more accurate than a defconfig.
+          cp "${SDK_KERNEL_CONFIG}" .config
+          echo "Baseline .config taken from ${SDK_KERNEL_CONFIG}"
 
           # Apply the options used by the upstream Makefile Build/Compile rule.
-          # A few of them do not exist in older kernels; failures here are not
-          # fatal because the verification afterwards catches real problems.
+          # Symbols that come from OpenWrt patches are unknown to the vanilla
+          # kernel and get dropped by olddefconfig with a warning.
           while read -r action symbol value; do
             case "$action" in
               "" | "#"*) continue ;;
@@ -271,10 +377,10 @@ jobs:
           # --- Dependency chain required by the upstream option set ---
           # In kernel/trace/Kconfig, KPROBE_EVENTS / UPROBE_EVENTS / BPF_EVENTS sit
           # inside an "if FTRACE" block, and TRACING (which selects TRACEPOINTS) is
-          # only selected by those symbols. The arm64 defconfig ships an explicit
-          # "# CONFIG_FTRACE is not set", and an explicit n wins over
-          # "default y if DEBUG_KERNEL", so olddefconfig would silently drop all
-          # of those options. FTRACE is therefore enabled explicitly.
+          # only selected by those symbols. OpenWrt disables FTRACE on some
+          # targets, and an explicit n wins over "default y if DEBUG_KERNEL", so
+          # olddefconfig would silently drop all of those options. FTRACE is
+          # therefore enabled explicitly.
           enable FTRACE
           enable TRACING
           # --- Copied from the QiuSimons/vmlinux-btf Makefile ---
@@ -311,6 +417,7 @@ jobs:
           disable DEBUG_INFO_SPLIT
           enable DEBUG_INFO_BTF
           set-str EXTRA_FIRMWARE ""
+          # The OpenWrt .config points this at its rootfs build directory
           set-str INITRAMFS_SOURCE ""
           # --- Extra options required in CI to avoid signing/certificate errors ---
           set-str SYSTEM_TRUSTED_KEYS ""
@@ -355,7 +462,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "${SRC_DIR}"
-          echo "Building: ARCH=${KERNEL_ARCH} CROSS_COMPILE=${CROSS_COMPILE:-<native>} JOBS=$(nproc)"
+          echo "Building: ARCH=${KERNEL_ARCH} CROSS_COMPILE=${CROSS_COMPILE} JOBS=$(nproc)"
           make -j"$(nproc)" \
             ARCH="${KERNEL_ARCH}" \
             CROSS_COMPILE="${CROSS_COMPILE}" \
@@ -363,7 +470,7 @@ jobs:
             vmlinux
           ls -lh ./vmlinux
 
-      - name: Encode BTF and package vmlinux-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}.tar.xz
+      - name: Encode BTF and package ${{ matrix.dist_name }}.tar.xz
         run: |
           set -euo pipefail
           cd "${SRC_DIR}"
@@ -384,11 +491,10 @@ jobs:
           ls -lh "${OUT_DIR}/vmlinux"
           file "${OUT_DIR}/vmlinux" || true
 
-          ARCHIVE="vmlinux-${ARCH_NAME}-${VERSION}.tar.xz"
+          ARCHIVE="${DIST_NAME}.tar.xz"
           # tar + xz (multi-threaded, otherwise packing a full vmlinux is slow)
           tar -C "${OUT_DIR}" -cf - vmlinux | xz -T0 -6 > "${GITHUB_WORKSPACE}/${ARCHIVE}"
 
-          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
           sha256sum "${GITHUB_WORKSPACE}/${ARCHIVE}" | tee "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256"
 
           echo "===== Archive contents ====="
@@ -396,12 +502,15 @@ jobs:
           ls -lh "${GITHUB_WORKSPACE}/${ARCHIVE}"
 
           {
-            echo "### vmlinux-${ARCH_NAME}-${VERSION}.tar.xz"
+            echo "### ${DIST_NAME}"
             echo ""
             echo '```'
             tar -tvJf "${GITHUB_WORKSPACE}/${ARCHIVE}"
             echo '```'
             echo ""
+            echo "- OpenWrt version: \`${OPENWRT_VERSION}\`"
+            echo "- OpenWrt arch: \`${OPENWRT_ARCH}\`"
+            echo "- Kernel version: \`${KERNEL_VERSION}\`"
             echo "- Artifact kind: \`${ARTIFACT_KIND}\`"
             echo "- pahole: \`$(pahole --version)\`"
             echo "- SHA256: \`$(cut -d' ' -f1 "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256")\`"
@@ -410,22 +519,24 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vmlinux-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}
+          name: ${{ matrix.dist_name }}
           path: |
-            vmlinux-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}.tar.xz
-            vmlinux-${{ matrix.arch }}-${{ needs.prepare.outputs.version }}.tar.xz.sha256
+            ${{ matrix.dist_name }}.tar.xz
+            ${{ matrix.dist_name }}.tar.xz.sha256
           # Already xz-compressed, no need to compress again
           compression-level: 0
           if-no-files-found: error
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 3. Publish the archives to a GitHub Release (tag: 0.1-<kernel version>)
+  # 3. Publish one GitHub Release per kernel version, collecting the assets of
+  #    every architecture that shares it
+  #    tag = openwrt-<openwrt_version>-<kernel_version>
   # ---------------------------------------------------------------------------
   release:
-    name: Publish GitHub release
+    name: Publish GitHub releases
     needs: [prepare, build]
-    # Publish only when both architectures were built successfully
+    # Publish only when every architecture was built successfully
     if: ${{ needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     # Writing to a release needs contents: write (the workflow default is read)
@@ -434,8 +545,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      KERNEL_VERSION: ${{ needs.prepare.outputs.version }}
-      TAG: "0.1-${{ needs.prepare.outputs.version }}"
+      OPENWRT_VERSION: ${{ needs.prepare.outputs.openwrt_version }}
+      MATRIX_JSON: ${{ needs.prepare.outputs.matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -443,86 +554,142 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: vmlinux-*
+          # Every architecture of this run; grouped by kernel version below
+          pattern: "*-vmlinux-*"
           path: dist
           merge-multiple: true
 
       - name: Check whether the tag and the release already exist
-        id: check
         run: |
           set -euo pipefail
 
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "release_exists=true" >> "$GITHUB_OUTPUT"
-            echo "Release ${TAG} already exists - skipping creation, assets will be overwritten."
-          else
-            echo "release_exists=false" >> "$GITHUB_OUTPUT"
-            echo "Release ${TAG} does not exist - it will be created."
+          state="${RUNNER_TEMP}/release-state.jsonl"
+          : > "${state}"
+
+          mapfile -t kernel_versions < <(jq -r '[.[].kernel_version] | unique[]' <<< "${MATRIX_JSON}")
+          if [ "${#kernel_versions[@]}" -eq 0 ]; then
+            echo "::error::The build matrix does not contain any kernel version"
+            exit 1
           fi
 
-          if gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} already exists - it will be reused."
-          else
-            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} does not exist - gh will create it."
-          fi
+          for kernel_version in "${kernel_versions[@]}"; do
+            tag="openwrt-${OPENWRT_VERSION}-${kernel_version}"
+
+            release_exists=false
+            if gh release view "${tag}" >/dev/null 2>&1; then
+              release_exists=true
+              echo "Release ${tag} already exists - skipping creation, assets will be overwritten."
+            else
+              echo "Release ${tag} does not exist - it will be created."
+            fi
+
+            tag_exists=false
+            if gh api "repos/${GH_REPO}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+              tag_exists=true
+              echo "Tag ${tag} already exists - it will be reused."
+            else
+              echo "Tag ${tag} does not exist - gh will create it."
+            fi
+
+            jq -nc \
+              --arg tag "${tag}" \
+              --arg kernel_version "${kernel_version}" \
+              --argjson release_exists "${release_exists}" \
+              --argjson tag_exists "${tag_exists}" \
+              '{tag:$tag,kernel_version:$kernel_version,release_exists:$release_exists,tag_exists:$tag_exists}' \
+              >> "${state}"
+          done
+
+          echo "Resolved $(wc -l < "${state}") release(s)"
 
       - name: Create tag and release with gh
-        if: steps.check.outputs.release_exists == 'false'
-        env:
-          TAG_EXISTS: ${{ steps.check.outputs.tag_exists }}
         run: |
           set -euo pipefail
 
-          cat > "${RUNNER_TEMP}/release-notes.md" <<EOF
-          Prebuilt vmlinux with embedded BTF, for CO-RE eBPF programs.
+          mapfile -t states < "${RUNNER_TEMP}/release-state.jsonl"
 
-          - Kernel version: ${KERNEL_VERSION}
-          - Architectures: x64 (x86_64), arm64 (aarch64)
-          - Build recipe: same option set as the upstream QiuSimons/vmlinux-btf Makefile
+          for entry in "${states[@]}"; do
+            IFS=$'\t' read -r tag kernel_version release_exists tag_exists \
+              <<< "$(jq -r '[.tag, .kernel_version, (.release_exists|tostring), (.tag_exists|tostring)] | @tsv' <<< "${entry}")"
+
+            if [ "${release_exists}" = "true" ]; then
+              echo "Release ${tag} already exists - skipping creation."
+              continue
+            fi
+
+            mapfile -t assets < <(jq -r --arg kv "${kernel_version}" \
+              '.[] | select(.kernel_version == $kv) | "- " + .dist_name + ".tar.xz  (OpenWrt arch " + .openwrt_arch + ", " + .target + "/" + .subtarget + ")"' \
+              <<< "${MATRIX_JSON}")
+
+            cat > "${RUNNER_TEMP}/release-notes.md" <<EOF
+          vmlinux with embedded BTF, for CO-RE eBPF programs.
+
+          - OpenWrt version: ${OPENWRT_VERSION}
+          - Kernel version: ${kernel_version}
 
           Assets:
 
-          - vmlinux-x64-${KERNEL_VERSION}.tar.xz
-          - vmlinux-arm64-${KERNEL_VERSION}.tar.xz
-          - SHA256 checksums (.sha256)
+          $(printf '%s\n' "${assets[@]}")
 
-          Each archive contains a single file named vmlinux.
+          Every archive contains a single file named vmlinux, plus its .sha256
+          checksum.
+
+          Build recipe: the option set of the upstream QiuSimons/vmlinux-btf
+          Makefile, applied on top of the kernel .config shipped in the official
+          OpenWrt SDK.
 
           Built by GitHub Actions run #${GITHUB_RUN_NUMBER} from commit ${GITHUB_SHA}.
           EOF
 
-          args=(--title "0.1-${KERNEL_VERSION}" --notes-file "${RUNNER_TEMP}/release-notes.md")
-          if [ "${TAG_EXISTS}" = "false" ]; then
-            # Point the newly created tag at the commit this workflow ran on
-            args+=(--target "${GITHUB_SHA}")
-          fi
+            args=(--title "${tag}" --notes-file "${RUNNER_TEMP}/release-notes.md")
+            if [ "${tag_exists}" = "false" ]; then
+              # Point the newly created tag at the commit this workflow ran on
+              args+=(--target "${GITHUB_SHA}")
+            fi
 
-          gh release create "${TAG}" "${args[@]}"
+            gh release create "${tag}" "${args[@]}"
+          done
 
       - name: Upload archives with gh
         run: |
           set -euo pipefail
-          shopt -s nullglob
 
-          files=(dist/*.tar.xz dist/*.sha256)
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::No archives found in dist/, did the build jobs upload their artifacts?"
-            exit 1
-          fi
+          mapfile -t states < "${RUNNER_TEMP}/release-state.jsonl"
 
-          echo "Uploading to release ${TAG}:"
-          printf '  %s\n' "${files[@]}"
-          gh release upload "${TAG}" "${files[@]}" --clobber
+          for entry in "${states[@]}"; do
+            IFS=$'\t' read -r tag kernel_version \
+              <<< "$(jq -r '[.tag, .kernel_version] | @tsv' <<< "${entry}")"
 
-          # The upload already succeeded, so do not fail the step if the summary
-          # lookup goes wrong
-          {
-            echo "### Release ${TAG}"
-            echo ""
-            echo "- URL: $(gh release view "${TAG}" --json url -q .url || true)"
-            echo "- Assets:"
-            gh release view "${TAG}" --json assets -q '.assets[].name' 2>/dev/null \
-              | sed 's/^/  - /' || true
-          } >> "$GITHUB_STEP_SUMMARY"
+            files=()
+            mapfile -t dist_names < <(jq -r --arg kv "${kernel_version}" \
+              '.[] | select(.kernel_version == $kv) | .dist_name' <<< "${MATRIX_JSON}")
+
+            for dist_name in "${dist_names[@]}"; do
+              if [ -f "dist/${dist_name}.tar.xz" ]; then
+                files+=("dist/${dist_name}.tar.xz")
+              fi
+              if [ -f "dist/${dist_name}.tar.xz.sha256" ]; then
+                files+=("dist/${dist_name}.tar.xz.sha256")
+              fi
+            done
+
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "::error::No archives found in dist/ for ${tag}, did the build jobs upload their artifacts?"
+              exit 1
+            fi
+
+            echo "Uploading to ${tag}:"
+            printf '  %s\n' "${files[@]}"
+            gh release upload "${tag}" "${files[@]}" --clobber
+
+            # The upload already succeeded, so do not fail the step if the
+            # summary lookup goes wrong
+            {
+              echo "### Release ${tag}"
+              echo ""
+              echo "- URL: $(gh release view "${tag}" --json url -q .url || true)"
+              echo "- Assets:"
+              gh release view "${tag}" --json assets -q '.assets[].name' 2>/dev/null \
+                | sed 's/^/  - /' || true
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
