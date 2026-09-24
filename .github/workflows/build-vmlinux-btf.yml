@@ -18,6 +18,12 @@ name: Build vmlinux (BTF)
 #   5. make olddefconfig && make vmlinux (with DWARF debug info)
 #   6. pahole --btf_encode_detached to extract the BTF data out of vmlinux
 #
+# The compiler itself also comes from OpenWrt: the gcc/binutils of the SDK
+# toolchain is put on PATH and used as CROSS_COMPILE, so the kernel is built
+# with the same GCC that OpenWrt uses for that target. Host tools still come
+# from the runner (OpenWrt does the same, its host tools are built with the
+# system compiler).
+#
 # The SDK does not carry the kernel source tree (it is stripped down to
 # headers, Module.symvers and the prebuilt modules) and OpenWrt leaves the
 # target specific patches out of it, so the kernel is compiled from the
@@ -288,15 +294,48 @@ jobs:
             echo "::error::The SDK does not provide a cross toolchain"
             exit 1
           fi
-          cross_prefix="$(basename "${cross_gcc}")"
-          cross_prefix="${cross_prefix%gcc}"
-          echo "Cross toolchain: ${cross_gcc}"
+          toolchain_bin="$(dirname "${cross_gcc}")"
+          # Absolute prefix, so the kernel build finds the OpenWrt gcc even if
+          # PATH is not set up as expected
+          cross_prefix="${toolchain_bin}/$(basename "${cross_gcc}" | sed 's/gcc$//')"
+          echo "OpenWrt toolchain: ${cross_prefix}"
 
           {
             echo "SDK_DIR=${SDK_DIR}"
             echo "SDK_KERNEL_CONFIG=${kernel_dir}/.config"
             echo "CROSS_COMPILE=${cross_prefix}"
           } >> "$GITHUB_ENV"
+
+          # Also expose the OpenWrt toolchain on PATH, the same way the OpenWrt
+          # buildroot does when it builds the kernel
+          echo "${toolchain_bin}" >> "$GITHUB_PATH"
+
+      - name: Verify the OpenWrt toolchain
+        run: |
+          set -euo pipefail
+
+          echo "CROSS_COMPILE=${CROSS_COMPILE}"
+          "${CROSS_COMPILE}gcc" --version | head -n1
+          echo "Target triple: $("${CROSS_COMPILE}gcc" -dumpmachine)"
+
+          # Smoke test: cross compile a tiny object, so a broken toolchain fails
+          # here instead of hours into the kernel build
+          printf 'int openwrt_gcc_smoke_test(void) { return 0; }\n' > "${RUNNER_TEMP}/smoke.c"
+          "${CROSS_COMPILE}gcc" -O2 -c "${RUNNER_TEMP}/smoke.c" -o "${RUNNER_TEMP}/smoke.o"
+          file "${RUNNER_TEMP}/smoke.o"
+
+          if [ "${KERNEL_ARCH}" = "x86_64" ]; then
+            expected="x86-64"
+          else
+            expected="aarch64"
+          fi
+
+          if file "${RUNNER_TEMP}/smoke.o" | grep -q "${expected}"; then
+            echo "Smoke test object is ${expected} - the OpenWrt toolchain works"
+          else
+            echo "::error::The smoke test object is not ${expected}"
+            exit 1
+          fi
 
       - name: Download and extract the kernel source
         run: |
