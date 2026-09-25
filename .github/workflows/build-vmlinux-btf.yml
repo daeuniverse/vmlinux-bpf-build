@@ -42,10 +42,22 @@ name: Build vmlinux (BTF)
 # different kernel .config, swap in another target/subtarget that reports the
 # same arch_packages (check profiles.json of that target).
 #
+# Two userspace binaries from the daeuniverse project are built as well and
+# published in the same release, for x86_64 and aarch64:
+#   dae  - Go, statically linked (CGO_ENABLED=0); no target C compiler is
+#          involved, its eBPF objects are compiled by clang on the host
+#   honk - Rust, cross compiled with the OpenWrt SDK toolchain, so its C/C++
+#          dependencies (BoringSSL, SQLite) are built by the SDK gcc/g++
+# dae needs no target toolchain at all, honk takes the SDK of its own
+# architecture. Both use ready-made compilers only: the Go release tarball,
+# rustup's prebuilt toolchains and the prebuilt bpf-linker.
+#
 # Naming of the archive and the uploaded artifact:
 #   <openwrt_version>-vmlinux-<openwrt_arch>-<kernel_version>
 #   e.g. 25.12.5-vmlinux-aarch64_cortex-a53-6.12.94.tar.xz
-# Each archive holds a single file named "vmlinux".
+#   <openwrt_version>-dae-<x86_64|aarch64>.tar.xz
+#   <openwrt_version>-honk-<x86_64|aarch64>.tar.xz
+# Each vmlinux archive holds a single file named "vmlinux".
 #
 # All architectures sharing the same kernel version are published together in
 # one GitHub Release with the gh CLI, tagged:
@@ -603,15 +615,453 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # 3. Publish one GitHub Release per kernel version, collecting the assets of
-  #    every architecture that shares it
+  # 3. Userspace binaries: dae (Go) and honk (Rust)
+  #
+  # Neither of them needs the OpenWrt SDK, because both are built without a
+  # target libc: dae is pure Go (CGO_ENABLED=0) and honk is linked as a static
+  # musl binary. They therefore run in parallel with the kernel builds and use
+  # ready-made toolchains only. Both recipes follow the projects' own CI.
+  # ---------------------------------------------------------------------------
+  dae:
+    name: Build dae (${{ matrix.suffix }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suffix: x86_64
+            goarch: amd64
+          - suffix: aarch64
+            goarch: arm64
+    env:
+      OPENWRT_VERSION: ${{ needs.prepare.outputs.openwrt_version }}
+      DIST_NAME: "${{ needs.prepare.outputs.openwrt_version }}-dae-${{ matrix.suffix }}"
+      GOOS: linux
+      GOARCH: ${{ matrix.goarch }}
+      # The exported GOARCH above is used for the final link only: the Makefile
+      # unsets GOOS/GOARCH around "go generate" so that bpf2go itself is built
+      # for and executed on the host (otherwise it fails with "exec format error").
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout dae
+        uses: actions/checkout@v4
+        with:
+          repository: daeuniverse/dae
+          ref: main
+          # control/kern/headers and trace/kern/headers are submodules
+          submodules: recursive
+          path: dae
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: dae/go.mod
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # clang is needed to compile the eBPF programs that bpf2go embeds
+          if ! sudo apt-get install -y --no-install-recommends clang-15 llvm-15; then
+            echo "::warning::clang-15 is not available, falling back to the default clang"
+            sudo apt-get install -y --no-install-recommends clang llvm
+          fi
+
+      - name: Build dae
+        working-directory: dae
+        run: |
+          set -euo pipefail
+
+          CLANG="$(command -v clang-15 || command -v clang)"
+          STRIP="$(command -v llvm-strip-15 || command -v llvm-strip)"
+          VERSION="$(git describe --tags --always)"
+
+          go version
+          echo "Building dae ${VERSION} for ${GOOS}/${GOARCH} with ${CLANG}"
+
+          make -j"$(nproc)" \
+            OUTPUT=dae \
+            VERSION="${VERSION}" \
+            GOFLAGS="-buildvcs=false" \
+            CC="${CLANG}" \
+            CLANG="${CLANG}" \
+            STRIP="${STRIP}" \
+            CGO_ENABLED=0
+
+          file ./dae
+
+          # Upstream's own artifact check; informational, our checks below are
+          # the gate
+          if [ -x scripts/check-artifact-build-env.sh ]; then
+            ./scripts/check-artifact-build-env.sh ./dae "${GOARCH}" \
+              || echo "::warning::scripts/check-artifact-build-env.sh reported a problem"
+          fi
+
+          # A pure Go binary must not need any shared library: OpenWrt ships
+          # neither glibc nor the libraries of the runner image
+          if command -v readelf >/dev/null; then
+            NEEDED="$(readelf -d ./dae 2>/dev/null | grep NEEDED || true)"
+            if [ -n "${NEEDED}" ]; then
+              echo "::warning::dae has dynamic dependencies:"
+              echo "${NEEDED}"
+            else
+              echo "dae is statically linked"
+            fi
+          fi
+
+      - name: Package ${DIST_NAME}.tar.xz
+        working-directory: dae
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="${RUNNER_TEMP}/pkg"
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}"
+          cp ./dae "${OUT_DIR}/dae"
+          cp LICENSE README.md "${OUT_DIR}/"
+
+          ARCHIVE="${DIST_NAME}.tar.xz"
+          tar -C "${OUT_DIR}" -cf - . | xz -T0 -6 > "${GITHUB_WORKSPACE}/${ARCHIVE}"
+
+          sha256sum "${GITHUB_WORKSPACE}/${ARCHIVE}" | tee "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256"
+          tar -tvJf "${GITHUB_WORKSPACE}/${ARCHIVE}"
+
+          {
+            echo "### ${DIST_NAME}"
+            echo ""
+            echo '```'
+            tar -tvJf "${GITHUB_WORKSPACE}/${ARCHIVE}"
+            echo '```'
+            echo ""
+            echo "- Source: daeuniverse/dae $(git describe --tags --always)"
+            echo "- SHA256: \`$(cut -d' ' -f1 "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.dist_name }}
+          path: |
+            ${{ env.DIST_NAME }}.tar.xz
+            ${{ env.DIST_NAME }}.tar.xz.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+
+  honk:
+    name: Build honk (${{ matrix.suffix }})
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # OpenWrt is musl based, so only the musl targets are built here. The
+          # aarch64 leg uses the generic armv8 SDK, so the binary runs on every
+          # aarch64 OpenWrt target.
+          - suffix: x86_64
+            target: x86_64-unknown-linux-musl
+            openwrt_arch: x86_64
+          - suffix: aarch64
+            target: aarch64-unknown-linux-musl
+            openwrt_arch: aarch64_generic
+    env:
+      OPENWRT_VERSION: ${{ needs.prepare.outputs.openwrt_version }}
+      DIST_NAME: "${{ needs.prepare.outputs.openwrt_version }}-honk-${{ matrix.suffix }}"
+      TARGET: ${{ matrix.target }}
+      OPENWRT_ARCH: ${{ matrix.openwrt_arch }}
+      MATRIX_JSON: ${{ needs.prepare.outputs.matrix }}
+    defaults:
+      run:
+        working-directory: honk
+    steps:
+      - name: Checkout honk
+        uses: actions/checkout@v4
+        with:
+          repository: daeuniverse/honk
+          ref: main
+          fetch-depth: 0
+          path: honk
+
+      - name: Download and extract the OpenWrt SDK
+        run: |
+          set -euo pipefail
+
+          SDK_URL="$(jq -r --arg a "${OPENWRT_ARCH}" '.[] | select(.openwrt_arch == $a) | .sdk_url' <<< "${MATRIX_JSON}")"
+          if [ -z "${SDK_URL}" ]; then
+            echo "::error::No SDK is known for OpenWrt arch ${OPENWRT_ARCH}"
+            exit 1
+          fi
+          SDK_NAME="${SDK_URL##*/}"
+          echo "SDK: ${SDK_NAME}"
+
+          mkdir -p "${RUNNER_TEMP}/sdk-dl" "${RUNNER_TEMP}/sdk"
+          curl -fL --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
+            -o "${RUNNER_TEMP}/sdk-dl/${SDK_NAME}" "${SDK_URL}"
+
+          case "${SDK_NAME}" in
+            *.tar.zst) opts=(--zstd) ;;
+            *.tar.xz)  opts=(-J) ;;
+            *)         opts=() ;;
+          esac
+          tar "${opts[@]}" -C "${RUNNER_TEMP}/sdk" -xf "${RUNNER_TEMP}/sdk-dl/${SDK_NAME}"
+          rm -rf "${RUNNER_TEMP}/sdk-dl"
+
+          SDK_DIR="$(find "${RUNNER_TEMP}/sdk" -mindepth 1 -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n1)"
+          cross_gcc="$(find "${SDK_DIR}"/staging_dir/toolchain-*/bin -maxdepth 1 -name '*-openwrt-linux-musl-gcc' | head -n1)"
+          cross_gxx="$(find "${SDK_DIR}"/staging_dir/toolchain-*/bin -maxdepth 1 -name '*-openwrt-linux-musl-g++' | head -n1)"
+          # STAGING_DIR is staging_dir/target-<arch>_<libc>, see the kernel job
+          staging_dir="$(find "${SDK_DIR}/staging_dir" -mindepth 1 -maxdepth 1 -type d -name 'target-*' | head -n1)"
+
+          if [ -z "${SDK_DIR}" ] || [ -z "${cross_gcc}" ] || [ -z "${cross_gxx}" ]; then
+            echo "::error::The SDK is missing its toolchain"
+            exit 1
+          fi
+
+          toolchain_bin="$(dirname "${cross_gcc}")"
+          echo "OpenWrt C compiler:   ${cross_gcc}"
+          echo "OpenWrt C++ compiler: ${cross_gxx}"
+
+          {
+            echo "OPENWRT_CC=${cross_gcc}"
+            echo "OPENWRT_CXX=${cross_gxx}"
+            echo "STAGING_DIR=${staging_dir}"
+            echo "STAGING_DIR_HOST=${SDK_DIR}/staging_dir/host"
+          } >> "$GITHUB_ENV"
+          echo "${toolchain_bin}" >> "$GITHUB_PATH"
+
+      - name: Prepare the OpenWrt toolchain for honk
+        run: |
+          set -euo pipefail
+
+          # CMake injects clang style target flags into boring-sys' compile rules
+          # (CMAKE_*_COMPILER_TARGET) and GCC rejects them. This is upstream's
+          # ci/zigcc trick, except that the real compiler is the OpenWrt one:
+          # the toolchain already targets the right triple, so the flags are
+          # simply dropped. (The Cortex-A53 errata options are kept, GCC
+          # understands them, unlike the zig linker driver.)
+          BIN_DIR="${RUNNER_TEMP}/ccwrap"
+          mkdir -p "${BIN_DIR}"
+
+          cat > "${BIN_DIR}/openwrt-cc" <<'WRAPPER'
+          #!/bin/sh
+          case "${0##*/}" in
+            *cxx*) cc="${OPENWRT_CXX}" ;;
+            *)     cc="${OPENWRT_CC}" ;;
+          esac
+          if [ -z "${cc}" ]; then
+            echo "${0##*/}: OPENWRT_CC / OPENWRT_CXX is not set" >&2
+            exit 1
+          fi
+          skip_next=0
+          kept=""
+          for arg in "$@"; do
+            if [ "${skip_next}" = 1 ]; then
+              skip_next=0
+              continue
+            fi
+            case "${arg}" in
+              --target=*) ;;
+              -target|--target) skip_next=1 ;;
+              *) kept="${kept}
+          ${arg}" ;;
+            esac
+          done
+          # The kept args are intentionally re-split, as upstream does: CMake and
+          # rustc pass them pre-split and none of them contain spaces here.
+          # shellcheck disable=SC2086
+          exec "${cc}" $(printf '%s' "${kept}" | tail -n +2)
+          WRAPPER
+          chmod +x "${BIN_DIR}/openwrt-cc"
+          ln -sf openwrt-cc "${BIN_DIR}/openwrt-cxx"
+
+          L="$(printf '%s' "${TARGET}" | tr '-' '_')"
+          U="$(printf '%s' "${TARGET}" | tr 'a-z-' 'A-Z_')"
+
+          # Link against the OpenWrt musl from the SDK sysroot instead of the
+          # musl bundled with Rust, so the binary matches the libc of the device.
+          # A static build is not required; the C++ runtime is linked in
+          # statically though, because a stock OpenWrt has no libstdc++.so (only
+          # the optional libstdcpp package).
+          rustflags="-C link-self-contained=no -C link-arg=-static-libstdc++"
+
+          # bindgen (used by boring-sys) must see the target headers, not the
+          # host glibc: reuse the include search list of the OpenWrt C++ compiler
+          bindgen_args="--target=${TARGET%%-*}-linux-musl"
+          while read -r inc; do
+            if [ -n "${inc}" ]; then
+              bindgen_args="${bindgen_args} -isystem ${inc}"
+            fi
+          done < <("${OPENWRT_CXX}" -E -x c++ -v /dev/null 2>&1 \
+                     | sed -n '/#include <...> search starts here:/,/End of search list./p' \
+                     | tail -n +2 | head -n -1 | sed 's/^[[:space:]]*//')
+
+          {
+            echo "CC_${L}=${BIN_DIR}/openwrt-cc"
+            echo "CXX_${L}=${BIN_DIR}/openwrt-cxx"
+            echo "CARGO_TARGET_${U}_LINKER=${BIN_DIR}/openwrt-cc"
+            echo "CARGO_TARGET_${U}_RUSTFLAGS=${rustflags}"
+            echo "BINDGEN_EXTRA_CLANG_ARGS=${bindgen_args}"
+          } >> "$GITHUB_ENV"
+
+          echo "Compiling C/C++ with: ${OPENWRT_CC}"
+
+      - name: Read the pinned Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      # Ready-made toolchains: rustup installs the compiler and the prebuilt
+      # std for the target, no cross toolchain build is involved
+      - name: Install Rust stable (with target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+          target: ${{ matrix.target }}
+
+      - name: Install Rust nightly (for the eBPF object)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
+
+      - name: Install the pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/bpf-linker.tar.zst" \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "${BPF_LINKER_SHA256}  ${RUNNER_TEMP}/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc "${RUNNER_TEMP}/bpf-linker.tar.zst" | tar -xf - -C "${CARGO_HOME}/bin"
+          bpf-linker --version
+
+      # The eBPF object is target-independent, so it is built once on the host
+      - name: Build the eBPF object
+        run: |
+          set -euo pipefail
+          cd crates/honk-ebpf
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+
+      # aya refuses objects without BTF, so fail here instead of on the device
+      - name: Verify the eBPF object has BTF
+        run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+
+      # BoringSSL (via boring-sys) is compiled by CMake through the OpenWrt
+      # gcc/g++ wrappers prepared above, and rustc links with the same toolchain
+      - name: Build honk-core
+        run: |
+          set -euo pipefail
+
+          # Default feature set (clash-api, mimalloc, rprx) plus the eBPF support
+          cargo build --release -p honk-core --features ebpf --target "${TARGET}"
+
+          file "target/${TARGET}/release/honk-core"
+
+      - name: Check the libc compatibility
+        run: |
+          set -euo pipefail
+
+          BIN="target/${TARGET}/release/honk-core"
+
+          # OpenWrt runs its own musl, so the binary has to be linked against
+          # exactly that (no glibc, no musl bundled by another toolchain)
+          if readelf -l "${BIN}" | grep -q 'program interpreter'; then
+            INTERP="$(readelf -l "${BIN}" | sed -n 's/.*program interpreter: *\([^]]*\)\].*/\1/p' | head -n1)"
+            echo "Dynamic loader: ${INTERP}"
+            case "${INTERP}" in
+              /lib/ld-musl-*) ;;
+              *)
+                echo "::error::honk-core asks for ${INTERP}, which is not the OpenWrt musl"
+                exit 1
+                ;;
+            esac
+          else
+            echo "honk-core is statically linked"
+          fi
+
+          NEEDED="$(readelf -d "${BIN}" | grep NEEDED || true)"
+          if [ -z "${NEEDED}" ]; then
+            exit 0
+          fi
+          echo "${NEEDED}"
+
+          # libsystemd does not exist on OpenWrt and would make the binary
+          # unusable on the target
+          if echo "${NEEDED}" | grep -q 'libsystemd'; then
+            echo "::error::honk-core links against libsystemd, which does not exist on OpenWrt"
+            exit 1
+          fi
+
+          # libc and the compiler runtime are provided by OpenWrt itself
+          extra="$(echo "${NEEDED}" | grep -Ev 'libc\.so|libgcc_s\.so' || true)"
+          if [ -n "${extra}" ]; then
+            echo "::warning::honk-core needs libraries besides libc, make sure OpenWrt provides them:"
+            echo "${extra}"
+          else
+            echo "Only libc and the compiler runtime are needed, which OpenWrt provides"
+          fi
+
+      - name: Package ${DIST_NAME}.tar.xz
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="${RUNNER_TEMP}/pkg"
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}"
+          cp "target/${{ matrix.target }}/release/honk-core" "${OUT_DIR}/"
+          cp LICENSE README.md "${OUT_DIR}/"
+
+          ARCHIVE="${DIST_NAME}.tar.xz"
+          tar -C "${OUT_DIR}" -cf - . | xz -T0 -6 > "${GITHUB_WORKSPACE}/${ARCHIVE}"
+
+          sha256sum "${GITHUB_WORKSPACE}/${ARCHIVE}" | tee "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256"
+          tar -tvJf "${GITHUB_WORKSPACE}/${ARCHIVE}"
+
+          {
+            echo "### ${DIST_NAME}"
+            echo ""
+            echo '```'
+            tar -tvJf "${GITHUB_WORKSPACE}/${ARCHIVE}"
+            echo '```'
+            echo ""
+            echo "- Source: daeuniverse/honk $(git describe --tags --always)"
+            echo "- Rust target: \`${{ matrix.target }}\`"
+            echo "- SHA256: \`$(cut -d' ' -f1 "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.dist_name }}
+          path: |
+            ${{ env.DIST_NAME }}.tar.xz
+            ${{ env.DIST_NAME }}.tar.xz.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 4. Publish one GitHub Release per kernel version, collecting the assets of
+  #    every architecture that shares it (plus the userspace binaries)
   #    tag = openwrt-<openwrt_version>-<kernel_version>
   # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub releases
-    needs: [prepare, build]
-    # Publish only when every architecture was built successfully
-    if: ${{ needs.build.result == 'success' }}
+    needs: [prepare, build, dae, honk]
+    # Publish the kernel assets whenever they built; the userspace jobs are best
+    # effort and their assets are attached when present
+    if: ${{ always() && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     # Writing to a release needs contents: write (the workflow default is read)
     permissions:
@@ -627,9 +1077,10 @@ jobs:
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
+        # Best effort: the kernel assets are what this job has to publish, the
+        # dae/honk assets are attached when those jobs succeeded
+        continue-on-error: true
         with:
-          # Every architecture of this run; grouped by kernel version below
-          pattern: "*-vmlinux-*"
           path: dist
           merge-multiple: true
 
@@ -705,6 +1156,9 @@ jobs:
 
           $(printf '%s\n' "${assets[@]}")
 
+          Userspace binaries for x86_64/aarch64 (dae, honk), when available, are
+          attached to this release as well.
+
           Every archive contains a single file named vmlinux, plus its .sha256
           checksum.
 
@@ -744,6 +1198,15 @@ jobs:
               fi
               if [ -f "dist/${dist_name}.tar.xz.sha256" ]; then
                 files+=("dist/${dist_name}.tar.xz.sha256")
+              fi
+            done
+
+            # The userspace binaries are not tied to a kernel version, so they go
+            # into every release group
+            for extra in dist/*-dae-*.tar.xz dist/*-dae-*.tar.xz.sha256 \
+                         dist/*-honk-*.tar.xz dist/*-honk-*.tar.xz.sha256; do
+              if [ -f "${extra}" ]; then
+                files+=("${extra}")
               fi
             done
 
