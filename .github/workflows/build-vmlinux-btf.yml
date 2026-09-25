@@ -43,11 +43,12 @@ name: Build vmlinux (BTF)
 # same arch_packages (check profiles.json of that target).
 #
 # Two userspace binaries from the daeuniverse project are built as well and
-# published in the same release, for x86_64 and aarch64:
+# published in the same release, one build per OpenWrt architecture:
 #   dae  - Go, statically linked (CGO_ENABLED=0); no target C compiler is
 #          involved, its eBPF objects are compiled by clang on the host
-#   honk - Rust, cross compiled with the OpenWrt SDK toolchain, so its C/C++
-#          dependencies (BoringSSL, SQLite) are built by the SDK gcc/g++
+#   honk - Rust, cross compiled with the OpenWrt SDK toolchain: its C/C++
+#          dependencies (BoringSSL, SQLite) are built by the SDK gcc/g++ and it
+#          links against the musl of that SDK, so the device needs libstdcpp
 # dae needs no target toolchain at all, honk takes the SDK of its own
 # architecture. Both use ready-made compilers only: the Go release tarball,
 # rustup's prebuilt toolchains and the prebuilt bpf-linker.
@@ -55,9 +56,20 @@ name: Build vmlinux (BTF)
 # Naming of the archive and the uploaded artifact:
 #   <openwrt_version>-vmlinux-<openwrt_arch>-<kernel_version>
 #   e.g. 25.12.5-vmlinux-aarch64_cortex-a53-6.12.94.tar.xz
-#   <openwrt_version>-dae-<x86_64|aarch64>.tar.xz
-#   <openwrt_version>-honk-<x86_64|aarch64>.tar.xz
 # Each vmlinux archive holds a single file named "vmlinux".
+#
+# The userspace binaries do not depend on the kernel version, so they carry a
+# release tag and a build date instead of it, following what upstream
+# publishes (dae has a rolling nightly build, honk has a rolling debug build):
+#   <openwrt_version>-dae-nightly-<openwrt_arch>-<date>.tar.xz
+#   <openwrt_version>-honk-debug-<openwrt_arch>-<date>.tar.xz
+#   e.g. 25.12.5-dae-nightly-aarch64_cortex-a53-2026-09-25.tar.xz
+# <date> is the build date in "date -I" form, resolved once in the prepare job
+# with TZ=Asia/Shanghai (the day boundary dae uses for its own nightly build,
+# so a UTC evening run is not labelled with yesterday). The same
+# "nightly-<date>" / "debug-<date>" string is the version the binaries report:
+# it is passed to dae's make as VERSION, and honk derives HONK_VERSION from
+# GITHUB_REF, so that is exported as a "refs/tags/debug-<date>" ref.
 #
 # All architectures sharing the same kernel version are published together in
 # one GitHub Release with the gh CLI, tagged:
@@ -108,6 +120,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       openwrt_version: ${{ steps.resolve.outputs.openwrt_version }}
+      build_date: ${{ steps.resolve.outputs.build_date }}
       matrix: ${{ steps.resolve.outputs.matrix }}
     steps:
       - name: Resolve SDK, kernel version and matrix
@@ -130,6 +143,12 @@ jobs:
             echo "::error::OpenWrt ${OPENWRT_VERSION} is not available at downloads.openwrt.org"
             exit 1
           fi
+
+          # Version number of the userspace assets, in "date -I" form. Resolved
+          # once here so every job of a run uses the same value. The timezone
+          # matches the day boundary upstream dae uses for its nightly builds.
+          BUILD_DATE="$(TZ=Asia/Shanghai date -I)"
+          echo "Userspace build date: ${BUILD_DATE}"
 
           : > /tmp/matrix.jsonl
           {
@@ -170,6 +189,12 @@ jobs:
             fi
 
             dist_name="${OPENWRT_VERSION}-vmlinux-${openwrt_arch}-${kernel_version}"
+            # The userspace assets are not tied to the kernel version: they carry
+            # the upstream release tag (nightly for dae, debug for honk) and the
+            # build date, so they are named here and reused by the build and
+            # release jobs instead of being derived from the kernel version
+            dae_dist_name="${OPENWRT_VERSION}-dae-nightly-${openwrt_arch}-${BUILD_DATE}"
+            honk_dist_name="${OPENWRT_VERSION}-honk-debug-${openwrt_arch}-${BUILD_DATE}"
 
             jq -nc \
               --arg openwrt_arch "${openwrt_arch}" \
@@ -180,7 +205,10 @@ jobs:
               --arg sdk_url "${url}/${sdk_name}" \
               --arg sdk_name "${sdk_name}" \
               --arg dist_name "${dist_name}" \
-              '{openwrt_arch:$openwrt_arch,target:$target,subtarget:$subtarget,kernel_arch:$kernel_arch,kernel_version:$kernel_version,sdk_url:$sdk_url,sdk_name:$sdk_name,dist_name:$dist_name}' \
+              --arg build_date "${BUILD_DATE}" \
+              --arg dae_dist_name "${dae_dist_name}" \
+              --arg honk_dist_name "${honk_dist_name}" \
+              '{openwrt_arch:$openwrt_arch,target:$target,subtarget:$subtarget,kernel_arch:$kernel_arch,kernel_version:$kernel_version,sdk_url:$sdk_url,sdk_name:$sdk_name,dist_name:$dist_name,build_date:$build_date,dae_dist_name:$dae_dist_name,honk_dist_name:$honk_dist_name}' \
               >> /tmp/matrix.jsonl
 
             echo "| ${openwrt_arch} | ${target}/${subtarget} | ${kernel_version} | ${sdk_name} |" >> "$GITHUB_STEP_SUMMARY"
@@ -196,7 +224,13 @@ jobs:
           echo "Resolved $(wc -l < /tmp/matrix.jsonl) targets"
 
           {
+            echo ""
+            echo "Userspace binaries: dae \`nightly-${BUILD_DATE}\`, honk \`debug-${BUILD_DATE}\` (one build per architecture)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
             echo "openwrt_version=${OPENWRT_VERSION}"
+            echo "build_date=${BUILD_DATE}"
             echo "matrix=$(jq -sc . /tmp/matrix.jsonl)"
           } >> "$GITHUB_OUTPUT"
 
@@ -623,26 +657,25 @@ jobs:
   # ready-made toolchains only. Both recipes follow the projects' own CI.
   # ---------------------------------------------------------------------------
   dae:
-    name: Build dae (${{ matrix.suffix }})
+    name: Build dae (${{ matrix.openwrt_arch }})
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      # One build per OpenWrt architecture, like the kernel assets
       matrix:
-        include:
-          - suffix: x86_64
-            goarch: amd64
-          - suffix: aarch64
-            goarch: arm64
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      OPENWRT_VERSION: ${{ needs.prepare.outputs.openwrt_version }}
-      DIST_NAME: "${{ needs.prepare.outputs.openwrt_version }}-dae-${{ matrix.suffix }}"
+      # No kernel version here: these assets are named by release tag and build
+      # date (see the header comment), so only the version source matters
+      OPENWRT_ARCH: ${{ matrix.openwrt_arch }}
+      KERNEL_ARCH: ${{ matrix.kernel_arch }}
+      BUILD_DATE: ${{ matrix.build_date }}
+      DIST_NAME: ${{ matrix.dae_dist_name }}
       GOOS: linux
-      GOARCH: ${{ matrix.goarch }}
-      # The exported GOARCH above is used for the final link only: the Makefile
-      # unsets GOOS/GOARCH around "go generate" so that bpf2go itself is built
-      # for and executed on the host (otherwise it fails with "exec format error").
+      # GOARCH is set in the build step: it is only used for the final link, see
+      # the comment there.
       CGO_ENABLED: "0"
     steps:
       - name: Checkout dae
@@ -674,12 +707,33 @@ jobs:
         run: |
           set -euo pipefail
 
+          # GOARCH is only used for the final link: the Makefile unsets
+          # GOOS/GOARCH around "go generate", so bpf2go is built for and runs on
+          # the host (otherwise it fails with "exec format error").
+          case "${KERNEL_ARCH}" in
+            x86_64)
+              GOARCH=amd64
+              GOAMD64=v1
+              ;;
+            *)
+              GOARCH=arm64
+              case "${OPENWRT_ARCH}" in
+                # Cortex-A76 is ARMv8.2 with LSE, the other aarch64 targets are ARMv8.0
+                aarch64_cortex-a76) GOARM64="v8.2,lse" ;;
+                *)                  GOARM64="v8.0" ;;
+              esac
+              ;;
+          esac
+          export GOARCH GOAMD64 GOARM64
+
           CLANG="$(command -v clang-15 || command -v clang)"
           STRIP="$(command -v llvm-strip-15 || command -v llvm-strip)"
-          VERSION="$(git describe --tags --always)"
+          # The version the binary reports is the nightly tag plus the build date,
+          # matching the asset name (dae's own default is unstable-<git date>...)
+          VERSION="nightly-${BUILD_DATE}"
 
           go version
-          echo "Building dae ${VERSION} for ${GOOS}/${GOARCH} with ${CLANG}"
+          echo "Building dae ${VERSION} for ${GOOS}/${GOARCH}${GOARM64:+ (GOARM64=${GOARM64})}${GOAMD64:+ (GOAMD64=${GOAMD64})} with ${CLANG}"
 
           make -j"$(nproc)" \
             OUTPUT=dae \
@@ -699,16 +753,30 @@ jobs:
               || echo "::warning::scripts/check-artifact-build-env.sh reported a problem"
           fi
 
+          # The binary must really be for the target and not for the runner, so
+          # that a broken GOARCH setting cannot end up in an asset named after
+          # another architecture
+          case "${GOARCH}" in
+            amd64) want="x86-64" ;;
+            arm64) want="ARM aarch64" ;;
+            *) echo "::error::Unexpected GOARCH ${GOARCH}"; exit 1 ;;
+          esac
+          if ! file -b ./dae | grep -q "${want}"; then
+            echo "::error::dae is not a ${GOARCH} binary: $(file -b ./dae)"
+            exit 1
+          fi
+          echo "dae is a ${GOARCH} binary"
+
           # A pure Go binary must not need any shared library: OpenWrt ships
           # neither glibc nor the libraries of the runner image
           if command -v readelf >/dev/null; then
             NEEDED="$(readelf -d ./dae 2>/dev/null | grep NEEDED || true)"
             if [ -n "${NEEDED}" ]; then
-              echo "::warning::dae has dynamic dependencies:"
+              echo "::error::dae has dynamic dependencies:"
               echo "${NEEDED}"
-            else
-              echo "dae is statically linked"
+              exit 1
             fi
+            echo "dae is statically linked"
           fi
 
       - name: Package ${DIST_NAME}.tar.xz
@@ -742,7 +810,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.dist_name }}
+          name: ${{ env.DIST_NAME }}
           path: |
             ${{ env.DIST_NAME }}.tar.xz
             ${{ env.DIST_NAME }}.tar.xz.sha256
@@ -751,29 +819,24 @@ jobs:
           retention-days: 30
 
   honk:
-    name: Build honk (${{ matrix.suffix }})
+    name: Build honk (${{ matrix.openwrt_arch }})
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
+      # One build per OpenWrt architecture, like the kernel assets: the Rust
+      # target and the C/C++ compiler both come from that architecture's SDK
       matrix:
-        include:
-          # OpenWrt is musl based, so only the musl targets are built here. The
-          # aarch64 leg uses the generic armv8 SDK, so the binary runs on every
-          # aarch64 OpenWrt target.
-          - suffix: x86_64
-            target: x86_64-unknown-linux-musl
-            openwrt_arch: x86_64
-          - suffix: aarch64
-            target: aarch64-unknown-linux-musl
-            openwrt_arch: aarch64_generic
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      OPENWRT_VERSION: ${{ needs.prepare.outputs.openwrt_version }}
-      DIST_NAME: "${{ needs.prepare.outputs.openwrt_version }}-honk-${{ matrix.suffix }}"
-      TARGET: ${{ matrix.target }}
+      # No kernel version here: these assets are named by release tag and build
+      # date (see the header comment), so only the version source matters
       OPENWRT_ARCH: ${{ matrix.openwrt_arch }}
-      MATRIX_JSON: ${{ needs.prepare.outputs.matrix }}
+      KERNEL_ARCH: ${{ matrix.kernel_arch }}
+      BUILD_DATE: ${{ matrix.build_date }}
+      SDK_URL: ${{ matrix.sdk_url }}
+      DIST_NAME: ${{ matrix.honk_dist_name }}
     defaults:
       run:
         working-directory: honk
@@ -790,9 +853,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          SDK_URL="$(jq -r --arg a "${OPENWRT_ARCH}" '.[] | select(.openwrt_arch == $a) | .sdk_url' <<< "${MATRIX_JSON}")"
           if [ -z "${SDK_URL}" ]; then
-            echo "::error::No SDK is known for OpenWrt arch ${OPENWRT_ARCH}"
+            echo "::error::No SDK URL for OpenWrt arch ${OPENWRT_ARCH}"
             exit 1
           fi
           SDK_NAME="${SDK_URL##*/}"
@@ -832,6 +894,25 @@ jobs:
             echo "STAGING_DIR_HOST=${SDK_DIR}/staging_dir/host"
           } >> "$GITHUB_ENV"
           echo "${toolchain_bin}" >> "$GITHUB_PATH"
+
+      - name: Resolve the Rust target
+        id: rust_target
+        run: |
+          set -euo pipefail
+
+          # OpenWrt is musl based, so the musl targets are the right ones
+          case "${KERNEL_ARCH}" in
+            x86_64) target=x86_64-unknown-linux-musl ;;
+            arm64)  target=aarch64-unknown-linux-musl ;;
+            *)
+              echo "::error::Unsupported kernel arch ${KERNEL_ARCH}"
+              exit 1
+              ;;
+          esac
+
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+          echo "TARGET=${target}" >> "$GITHUB_ENV"
+          echo "Rust target: ${target}"
 
       - name: Prepare the OpenWrt toolchain for honk
         run: |
@@ -883,10 +964,11 @@ jobs:
 
           # Link against the OpenWrt musl from the SDK sysroot instead of the
           # musl bundled with Rust, so the binary matches the libc of the device.
-          # A static build is not required; the C++ runtime is linked in
-          # statically though, because a stock OpenWrt has no libstdc++.so (only
-          # the optional libstdcpp package).
-          rustflags="-C link-self-contained=no -C link-arg=-static-libstdc++"
+          # crt-static is turned off as well: the OpenWrt toolchain has no static
+          # unwind library (libgcc_eh.a), so its static libstdc++ cannot be used
+          # either and everything is linked dynamically. The device therefore
+          # needs the libstdcpp and libgcc packages, which OpenWrt provides.
+          rustflags="-C link-self-contained=no -C target-feature=-crt-static"
 
           # bindgen (used by boring-sys) must see the target headers, not the
           # host glibc: reuse the include search list of the OpenWrt C++ compiler
@@ -922,7 +1004,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ steps.toolchain.outputs.stable }}
-          target: ${{ matrix.target }}
+          target: ${{ steps.rust_target.outputs.target }}
 
       - name: Install Rust nightly (for the eBPF object)
         uses: dtolnay/rust-toolchain@stable
@@ -963,10 +1045,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          # honk's build script reads the release tag from GITHUB_REF when it is a
+          # tag ref and embeds it as HONK_VERSION, so export the rolling debug tag
+          # that names this asset: "honk-core --version" then reports debug-<date>
+          export GITHUB_REF="refs/tags/debug-${BUILD_DATE}"
+
           # Default feature set (clash-api, mimalloc, rprx) plus the eBPF support
           cargo build --release -p honk-core --features ebpf --target "${TARGET}"
 
           file "target/${TARGET}/release/honk-core"
+
+          # The binary cannot be executed here (it is a musl binary for the
+          # target architecture), so assert on the embedded string instead:
+          # honk's build script must have taken the debug tag, not the git
+          # fallback it uses when GITHUB_REF is not a tag ref
+          if ! grep -aq "debug-${BUILD_DATE}" "target/${TARGET}/release/honk-core"; then
+            echo "::error::honk-core does not embed the expected version debug-${BUILD_DATE}"
+            exit 1
+          fi
+          echo "honk-core embeds version debug-${BUILD_DATE}"
 
       - name: Check the libc compatibility
         run: |
@@ -1004,12 +1101,15 @@ jobs:
           fi
 
           # libc and the compiler runtime are provided by OpenWrt itself
-          extra="$(echo "${NEEDED}" | grep -Ev 'libc\.so|libgcc_s\.so' || true)"
+          if echo "${NEEDED}" | grep -q 'libstdc++'; then
+            echo "::warning::honk-core needs libstdc++.so.6, install the libstdcpp package on the device"
+          fi
+          extra="$(echo "${NEEDED}" | grep -Ev 'libc\.so|libgcc_s\.so|libstdc\+\+\.so' || true)"
           if [ -n "${extra}" ]; then
-            echo "::warning::honk-core needs libraries besides libc, make sure OpenWrt provides them:"
+            echo "::warning::honk-core needs libraries besides libc and the C++ runtime, make sure OpenWrt provides them:"
             echo "${extra}"
           else
-            echo "Only libc and the compiler runtime are needed, which OpenWrt provides"
+            echo "Only libc, the C++ runtime and the compiler runtime are needed"
           fi
 
       - name: Package ${DIST_NAME}.tar.xz
@@ -1019,7 +1119,7 @@ jobs:
           OUT_DIR="${RUNNER_TEMP}/pkg"
           rm -rf "${OUT_DIR}"
           mkdir -p "${OUT_DIR}"
-          cp "target/${{ matrix.target }}/release/honk-core" "${OUT_DIR}/"
+          cp "target/${TARGET}/release/honk-core" "${OUT_DIR}/"
           cp LICENSE README.md "${OUT_DIR}/"
 
           ARCHIVE="${DIST_NAME}.tar.xz"
@@ -1036,14 +1136,14 @@ jobs:
             echo '```'
             echo ""
             echo "- Source: daeuniverse/honk $(git describe --tags --always)"
-            echo "- Rust target: \`${{ matrix.target }}\`"
+            echo "- Rust target: \`${TARGET}\`"
             echo "- SHA256: \`$(cut -d' ' -f1 "${GITHUB_WORKSPACE}/${ARCHIVE}.sha256")\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.dist_name }}
+          name: ${{ env.DIST_NAME }}
           path: |
             ${{ env.DIST_NAME }}.tar.xz
             ${{ env.DIST_NAME }}.tar.xz.sha256
@@ -1156,8 +1256,13 @@ jobs:
 
           $(printf '%s\n' "${assets[@]}")
 
-          Userspace binaries for x86_64/aarch64 (dae, honk), when available, are
-          attached to this release as well.
+          Userspace binaries (dae, honk) for all OpenWrt architectures of this
+          run, when available, are attached as well. They do not depend on the
+          kernel version; their name carries the release tag (nightly for dae,
+          debug for honk) and the build date instead of it:
+
+          - <openwrt_version>-dae-nightly-<openwrt_arch>-<date>.tar.xz
+          - <openwrt_version>-honk-debug-<openwrt_arch>-<date>.tar.xz
 
           Every archive contains a single file named vmlinux, plus its .sha256
           checksum.
@@ -1201,13 +1306,18 @@ jobs:
               fi
             done
 
-            # The userspace binaries are not tied to a kernel version, so they go
-            # into every release group
-            for extra in dist/*-dae-*.tar.xz dist/*-dae-*.tar.xz.sha256 \
-                         dist/*-honk-*.tar.xz dist/*-honk-*.tar.xz.sha256; do
-              if [ -f "${extra}" ]; then
-                files+=("${extra}")
-              fi
+            # Userspace binaries: they do not depend on the kernel version, so
+            # every release published by this run carries the full set. Their
+            # names come from the matrix (release tag + build date), one build
+            # per OpenWrt architecture.
+            mapfile -t userspace_names < <(jq -r '[.[] | .dae_dist_name, .honk_dist_name] | unique[]' <<< "${MATRIX_JSON}")
+
+            for name in "${userspace_names[@]}"; do
+              for suffix in .tar.xz .tar.xz.sha256; do
+                if [ -f "dist/${name}${suffix}" ]; then
+                  files+=("dist/${name}${suffix}")
+                fi
+              done
             done
 
             if [ "${#files[@]}" -eq 0 ]; then
